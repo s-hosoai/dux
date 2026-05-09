@@ -43,23 +43,28 @@ type DirNode struct {
 	DiskSize int64 // actual on-disk allocation; 0 means not measured
 	Depth    int
 	Children []*DirNode
+	IsFile   bool
 }
 
 type scanner struct {
-	sizes      map[string]int64
-	diskDeltas map[string]int64 // per-dir sum of (diskSize - logicalSize) for files >= 10GB
-	mu         sync.Mutex
-	sem        chan struct{}
-	fileCount  int64
-	dirCount   int64
-	errCount   int64
+	sizes         map[string]int64
+	diskDeltas    map[string]int64 // per-dir sum of (diskSize - logicalSize) for files >= 10GB
+	fileSizes     map[string]int64
+	fileDiskSizes map[string]int64 // actual disk size for files >= 10GB
+	mu            sync.Mutex
+	sem           chan struct{}
+	fileCount     int64
+	dirCount      int64
+	errCount      int64
 }
 
 func newScanner(concurrency int) *scanner {
 	return &scanner{
-		sizes:      make(map[string]int64),
-		diskDeltas: make(map[string]int64),
-		sem:        make(chan struct{}, concurrency),
+		sizes:         make(map[string]int64),
+		diskDeltas:    make(map[string]int64),
+		fileSizes:     make(map[string]int64),
+		fileDiskSizes: make(map[string]int64),
+		sem:           make(chan struct{}, concurrency),
 	}
 }
 
@@ -109,10 +114,17 @@ func (s *scanner) scan(path string) (logical, diskDelta int64) {
 			atomic.AddInt64(&s.fileCount, 1)
 			lsz := info.Size()
 			fileSize += lsz
+			var diskSz int64
 			if lsz >= 10<<30 {
-				disk := getDiskSize(fullPath, lsz)
-				fileDiskDelta += disk - lsz
+				diskSz = getDiskSize(fullPath, lsz)
+				fileDiskDelta += diskSz - lsz
 			}
+			s.mu.Lock()
+			s.fileSizes[fullPath] = lsz
+			if diskSz != 0 {
+				s.fileDiskSizes[fullPath] = diskSz
+			}
+			s.mu.Unlock()
 		}
 	}
 	wg.Wait()
@@ -233,12 +245,12 @@ func main() {
 	if cfg.Flat {
 		printFlat(sc.sizes, absRoot, cfg)
 	} else {
-		rootNode := buildTree(sc.sizes, sc.diskDeltas, absRoot)
+		rootNode := buildTree(sc.sizes, sc.diskDeltas, sc.fileSizes, sc.fileDiskSizes, absRoot)
 		if rootNode == nil {
 			return
 		}
 		if !textMode {
-			if err := runTUI(rootNode, cfg); err != nil {
+			if err := runTUI(rootNode, absRoot, cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "TUIエラー: %v\n", err)
 			}
 		} else {
@@ -247,7 +259,7 @@ func main() {
 	}
 }
 
-func buildTree(dirSizes map[string]int64, diskDeltas map[string]int64, absRoot string) *DirNode {
+func buildTree(dirSizes map[string]int64, diskDeltas map[string]int64, fileSizes map[string]int64, fileDiskSizes map[string]int64, absRoot string) *DirNode {
 	nodes := make(map[string]*DirNode)
 
 	for path, size := range dirSizes {
@@ -279,6 +291,29 @@ func buildTree(dirSizes map[string]int64, diskDeltas map[string]int64, absRoot s
 		parent := filepath.Dir(path)
 		if parentNode, ok := nodes[parent]; ok {
 			parentNode.Children = append(parentNode.Children, node)
+		}
+	}
+
+	for path, size := range fileSizes {
+		parent := filepath.Dir(path)
+		if parentNode, ok := nodes[parent]; ok {
+			relPath, err := filepath.Rel(absRoot, path)
+			if err != nil {
+				continue
+			}
+			depth := strings.Count(relPath, string(filepath.Separator)) + 1
+			var diskSize int64
+			if ds, ok := fileDiskSizes[path]; ok {
+				diskSize = ds
+			}
+			parentNode.Children = append(parentNode.Children, &DirNode{
+				Path:     path,
+				Name:     filepath.Base(path),
+				Size:     size,
+				DiskSize: diskSize,
+				Depth:    depth,
+				IsFile:   true,
+			})
 		}
 	}
 

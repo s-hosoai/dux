@@ -26,20 +26,33 @@ type tuiItem struct {
 }
 
 type tuiModel struct {
-	root     *DirNode
-	cfg      Config
-	items    []tuiItem
-	expanded map[*DirNode]bool
-	cursor   int
-	offset   int
-	height   int
-	width    int
+	root      *DirNode
+	absRoot   string
+	cfg       Config
+	items     []tuiItem
+	expanded  map[*DirNode]bool
+	cursor    int
+	offset    int
+	height    int
+	width     int
+	reloading bool
 }
 
-func newTUIModel(root *DirNode, cfg Config) tuiModel {
+type reloadMsg struct{ root *DirNode }
+
+func startReload(absRoot string, cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		sc := newScanner(cfg.Concurrency)
+		sc.scan(absRoot)
+		return reloadMsg{root: buildTree(sc.sizes, sc.diskDeltas, sc.fileSizes, sc.fileDiskSizes, absRoot)}
+	}
+}
+
+func newTUIModel(root *DirNode, absRoot string, cfg Config) tuiModel {
 	expanded := map[*DirNode]bool{root: true}
 	return tuiModel{
 		root:     root,
+		absRoot:  absRoot,
 		cfg:      cfg,
 		items:    buildTUIItems(root, expanded, cfg),
 		expanded: expanded,
@@ -77,6 +90,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "Q", "esc", "ctrl+c":
 			return m, tea.Quit
+
+		case "r", "R":
+			if !m.reloading {
+				m.reloading = true
+				return m, startReload(m.absRoot, m.cfg)
+			}
 
 		case "up", "k":
 			if m.cursor > 0 {
@@ -135,6 +154,16 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+	case reloadMsg:
+		if msg.root != nil {
+			m.root = msg.root
+			m.expanded = map[*DirNode]bool{msg.root: true}
+			m.items = buildTUIItems(msg.root, m.expanded, m.cfg)
+			if m.cursor >= len(m.items) {
+				m.cursor = len(m.items) - 1
+			}
+		}
+		m.reloading = false
 	}
 	return m, nil
 }
@@ -183,9 +212,11 @@ func (m tuiModel) View() string {
 	sb.WriteByte('\n')
 
 	// ステータスバー（キー操作ヒント）
-	sb.WriteString(statusSt.Width(m.width).Render(
-		" ↑↓/jk: 移動   Enter/Space/→/l: 展開   ←/h: 折りたたみ   q: 終了",
-	))
+	hint := " ↑↓/jk: 移動   Enter/Space/→/l: 展開   ←/h: 折りたたみ   r: 再読み込み   q: 終了"
+	if m.reloading {
+		hint = " 再読み込み中..."
+	}
+	sb.WriteString(statusSt.Width(m.width).Render(hint))
 
 	return sb.String()
 }
@@ -203,13 +234,17 @@ func (m tuiModel) renderLine(idx int) string {
 	indent := strings.Repeat("  ", it.depth)
 
 	// 展開インジケータ
-	expander := "  "
-	if len(it.node.Children) > 0 {
+	var expander string
+	if it.node.IsFile {
+		expander = "· "
+	} else if len(it.node.Children) > 0 {
 		if m.expanded[it.node] {
 			expander = "▼ "
 		} else {
 			expander = "▶ "
 		}
+	} else {
+		expander = "  "
 	}
 
 	sized := sizeStyleOf(it.node.Size).Render(formatSize(it.node.Size))
@@ -220,6 +255,8 @@ func (m tuiModel) renderLine(idx int) string {
 	}
 	if selected {
 		name = boldSt.Render(name)
+	} else if it.node.IsFile {
+		name = sizeFaint.Render(name)
 	}
 
 	return cur + " " + indent + expander + sized + "  " + name
@@ -238,8 +275,8 @@ func sizeStyleOf(size int64) lipgloss.Style {
 	}
 }
 
-func runTUI(root *DirNode, cfg Config) error {
-	p := tea.NewProgram(newTUIModel(root, cfg), tea.WithAltScreen())
+func runTUI(root *DirNode, absRoot string, cfg Config) error {
+	p := tea.NewProgram(newTUIModel(root, absRoot, cfg), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
