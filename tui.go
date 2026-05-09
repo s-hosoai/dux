@@ -113,8 +113,25 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.items) {
 				node := m.items[m.cursor].node
 				if m.expanded[node] {
+					// collapse this node
 					m.expanded[node] = false
 					m.items = buildTUIItems(m.root, m.expanded, m.cfg)
+				} else {
+					// already collapsed or leaf: jump to parent and collapse it
+					curDepth := m.items[m.cursor].depth
+					if curDepth > 0 {
+						for i := m.cursor - 1; i >= 0; i-- {
+							if m.items[i].depth == curDepth-1 {
+								m.cursor = i
+								m.expanded[m.items[i].node] = false
+								m.items = buildTUIItems(m.root, m.expanded, m.cfg)
+								if m.cursor < m.offset {
+									m.offset = m.cursor
+								}
+								break
+							}
+						}
+					}
 				}
 			}
 		}
@@ -149,9 +166,17 @@ func (m tuiModel) View() string {
 	// 情報バー（現在ノードのフルパス＋サイズ）
 	if m.cursor < len(m.items) {
 		node := m.items[m.cursor].node
-		sb.WriteString(infoSt.Width(m.width).Render(
-			fmt.Sprintf(" %s  %s", formatSize(node.Size), node.Path),
-		))
+		info := fmt.Sprintf(" %s  %s", formatSize(node.Size), node.Path)
+		if node.DiskSize != 0 {
+			diff := node.DiskSize - node.Size
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff >= 1<<20 {
+				info += fmt.Sprintf("  (disk: %s)", formatSize(node.DiskSize))
+			}
+		}
+		sb.WriteString(infoSt.Width(m.width).Render(info))
 	} else {
 		sb.WriteString(infoSt.Width(m.width).Render(""))
 	}

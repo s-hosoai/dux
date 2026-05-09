@@ -40,37 +40,40 @@ type DirNode struct {
 	Path     string
 	Name     string
 	Size     int64
+	DiskSize int64 // actual on-disk allocation; 0 means not measured
 	Depth    int
 	Children []*DirNode
 }
 
 type scanner struct {
-	sizes     map[string]int64
-	mu        sync.Mutex
-	sem       chan struct{}
-	fileCount int64
-	dirCount  int64
-	errCount  int64
+	sizes      map[string]int64
+	diskDeltas map[string]int64 // per-dir sum of (diskSize - logicalSize) for files >= 10GB
+	mu         sync.Mutex
+	sem        chan struct{}
+	fileCount  int64
+	dirCount   int64
+	errCount   int64
 }
 
 func newScanner(concurrency int) *scanner {
 	return &scanner{
-		sizes: make(map[string]int64),
-		sem:   make(chan struct{}, concurrency),
+		sizes:      make(map[string]int64),
+		diskDeltas: make(map[string]int64),
+		sem:        make(chan struct{}, concurrency),
 	}
 }
 
-func (s *scanner) scan(path string) int64 {
+func (s *scanner) scan(path string) (logical, diskDelta int64) {
 	atomic.AddInt64(&s.dirCount, 1)
 
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		atomic.AddInt64(&s.errCount, 1)
-		return 0
+		return 0, 0
 	}
 
-	var fileSize int64
-	var childSize int64
+	var fileSize, fileDiskDelta int64
+	var childSize, childDiskDelta int64
 	var childMu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -83,15 +86,17 @@ func (s *scanner) scan(path string) int64 {
 				go func(p string) {
 					defer wg.Done()
 					defer func() { <-s.sem }()
-					size := s.scan(p)
+					sz, dd := s.scan(p)
 					childMu.Lock()
-					childSize += size
+					childSize += sz
+					childDiskDelta += dd
 					childMu.Unlock()
 				}(fullPath)
 			default:
-				size := s.scan(fullPath)
+				sz, dd := s.scan(fullPath)
 				childMu.Lock()
-				childSize += size
+				childSize += sz
+				childDiskDelta += dd
 				childMu.Unlock()
 				wg.Done()
 			}
@@ -102,17 +107,26 @@ func (s *scanner) scan(path string) int64 {
 				continue
 			}
 			atomic.AddInt64(&s.fileCount, 1)
-			fileSize += info.Size()
+			lsz := info.Size()
+			fileSize += lsz
+			if lsz >= 10<<30 {
+				disk := getDiskSize(fullPath, lsz)
+				fileDiskDelta += disk - lsz
+			}
 		}
 	}
 	wg.Wait()
 
 	total := fileSize + childSize
+	delta := fileDiskDelta + childDiskDelta
 	s.mu.Lock()
 	s.sizes[path] = total
+	if delta != 0 {
+		s.diskDeltas[path] = delta
+	}
 	s.mu.Unlock()
 
-	return total
+	return total, delta
 }
 
 func main() {
@@ -219,7 +233,7 @@ func main() {
 	if cfg.Flat {
 		printFlat(sc.sizes, absRoot, cfg)
 	} else {
-		rootNode := buildTree(sc.sizes, absRoot)
+		rootNode := buildTree(sc.sizes, sc.diskDeltas, absRoot)
 		if rootNode == nil {
 			return
 		}
@@ -233,7 +247,7 @@ func main() {
 	}
 }
 
-func buildTree(dirSizes map[string]int64, absRoot string) *DirNode {
+func buildTree(dirSizes map[string]int64, diskDeltas map[string]int64, absRoot string) *DirNode {
 	nodes := make(map[string]*DirNode)
 
 	for path, size := range dirSizes {
@@ -245,11 +259,16 @@ func buildTree(dirSizes map[string]int64, absRoot string) *DirNode {
 		if relPath != "." {
 			depth = strings.Count(relPath, string(filepath.Separator)) + 1
 		}
+		var diskSize int64
+		if delta, ok := diskDeltas[path]; ok {
+			diskSize = size + delta
+		}
 		nodes[path] = &DirNode{
-			Path:  path,
-			Name:  filepath.Base(path),
-			Size:  size,
-			Depth: depth,
+			Path:     path,
+			Name:     filepath.Base(path),
+			Size:     size,
+			DiskSize: diskSize,
+			Depth:    depth,
 		}
 	}
 
@@ -266,6 +285,23 @@ func buildTree(dirSizes map[string]int64, absRoot string) *DirNode {
 	return nodes[absRoot]
 }
 
+// diskNote returns a parenthetical disk-size annotation when on-disk allocation
+// differs from logical size by >= 1 MB (non-zero DiskSize means it was measured).
+func diskNote(node *DirNode, noColor bool) string {
+	if node.DiskSize == 0 {
+		return ""
+	}
+	diff := node.DiskSize - node.Size
+	if diff < 0 {
+		diff = -diff
+	}
+	if diff < 1<<20 {
+		return ""
+	}
+	note := fmt.Sprintf(" (disk: %s)", formatSize(node.DiskSize))
+	return colorStr(note, colorDim, noColor)
+}
+
 func printTree(node *DirNode, cfg Config, prefix string, isLast bool) {
 	if cfg.MaxDepth >= 0 && node.Depth > cfg.MaxDepth {
 		return
@@ -275,18 +311,20 @@ func printTree(node *DirNode, cfg Config, prefix string, isLast bool) {
 	}
 
 	sizeStr := colorizeSize(node.Size, cfg.NoColor, node.Depth == 0)
+	note := diskNote(node, cfg.NoColor)
 
 	if node.Depth == 0 {
-		fmt.Printf("%s  %s\n", sizeStr, colorStr(node.Path, colorBold, cfg.NoColor))
+		fmt.Printf("%s  %s%s\n", sizeStr, colorStr(node.Path, colorBold, cfg.NoColor), note)
 	} else {
 		connector := "├── "
 		if isLast {
 			connector = "└── "
 		}
-		fmt.Printf("%s  %s%s\n",
+		fmt.Printf("%s  %s%s%s\n",
 			sizeStr,
 			colorStr(prefix+connector, colorDim, cfg.NoColor),
 			colorStr(node.Name, colorCyan, cfg.NoColor),
+			note,
 		)
 	}
 
