@@ -1,4 +1,4 @@
-module dux
+module github.com/s-hosoai/dux
 
 go 1.24.0
 
