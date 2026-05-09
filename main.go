@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/term"
+	"github.com/mattn/go-isatty"
 )
 
 const (
@@ -161,7 +161,7 @@ func main() {
 	}
 
 	// -flat またはパイプ出力のときのみ ANSI テキストモード
-	textMode := cfg.Flat || cfg.NoColor || !term.IsTerminal(int(os.Stdout.Fd()))
+	textMode := cfg.Flat || cfg.NoColor || !isatty.IsTerminal(os.Stdout.Fd())
 	if textMode && !cfg.NoColor {
 		enableANSI()
 	}
