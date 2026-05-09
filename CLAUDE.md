@@ -67,4 +67,4 @@ go build -o dux.exe .
 - スキャン進捗はstderrに出力、結果はstdoutに出力（パイプ・リダイレクト可能）
 - アクセス拒否ディレクトリはスキップして集計を継続
 - `dux.exe.manifest` は `asInvoker` を宣言しUAC昇格を防止（`C:\Windows\System32\diskusage.exe` との名前衝突が解消済みのため予防的措置）
-- TUI は `tview` + `tcell`（Win32 Console APIドライバ）を使用。入力レイテンシあり → `bubbletea` への移行を検討中
+- TUI は `bubbletea` + `lipgloss` を使用。`erikgeiser/coninput` により Windows でも低レイテンシなキー入力を実現
