@@ -1,0 +1,4 @@
+dux.exe
+*.log
+*.txt
+.claude/
